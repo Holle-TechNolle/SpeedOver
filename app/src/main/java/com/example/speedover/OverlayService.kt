@@ -1,5 +1,4 @@
-﻿// OverlayService.kt
-package com.example.speedover
+﻿package com.example.speedover
 
 import android.annotation.SuppressLint
 import android.app.*
@@ -8,8 +7,10 @@ import android.graphics.*
 import android.graphics.PixelFormat
 import android.location.*
 import android.os.*
+import android.util.Log
 import android.view.*
 import androidx.core.app.NotificationCompat
+import org.json.JSONObject
 
 /**
  * SpeedOver Safety Awareness
@@ -22,11 +23,12 @@ import androidx.core.app.NotificationCompat
  *     so all touches pass through to the app beneath (MIUI-safe via alpha = 0.5f trick).
  *   - GPS delivered via PendingIntent rather than LocationListener, which is more
  *     resilient to MIUI background throttling.
- *   - A keepalive handler re-registers GPS every N seconds as an additional safeguard.
+ *   - GPS keepalive handler re-registers GPS every N seconds as an additional safeguard.
+ *   - Speed limit fetched from HERE Routing API v8 every 15 seconds when speed >= 20 km/h.
+ *     Shows "00" when below threshold or when no HERE API key is configured.
  *   - Screen kept on via FLAG_KEEP_SCREEN_ON + SCREEN_DIM_WAKE_LOCK.
- *   - Auto-hide: overlay is hidden after 2 minutes below 5 km/h, and restored as
- *     soon as speed reaches 5 km/h again.
- *   - Arrow is initialised to NW (315°) at boot and on settings exit so it is always
+ *   - Auto-hide: overlay hidden after 2 minutes below 5 km/h, restored above 5 km/h.
+ *   - Arrow initialised to NW (315°) at boot and on settings exit so it is always
  *     visible before GPS delivers its first bearing fix.
  *
  * Personal use only. Untested. Built for Xiaomi T10 — may work on other devices.
@@ -41,7 +43,8 @@ class OverlayService : Service() {
         const val ACTION_MOVE            = "com.example.speedover.MOVE"
         const val ACTION_LOCATION_UPDATE = "com.example.speedover.LOCATION_UPDATE"
         const val CHANNEL_ID             = "SpeedOverChannel"
-        const val BEARING_FALLBACK       = 315f   // NW — shown before GPS reports a bearing
+        const val BEARING_FALLBACK       = 315f
+        const val TAG                    = "SpeedOver"
 
         var isRunning = false
     }
@@ -55,6 +58,9 @@ class OverlayService : Service() {
     private lateinit var textParams: WindowManager.LayoutParams
 
     private var locationPendingIntent: PendingIntent? = null
+
+    private var currentLat = 0.0
+    private var currentLon = 0.0
 
     // --- Auto-hide state ---
     private var isAutoHidden     = false
@@ -75,9 +81,22 @@ class OverlayService : Service() {
     private val gpsKeepaliveHandler  = Handler(Looper.getMainLooper())
     private val gpsKeepaliveRunnable = object : Runnable {
         override fun run() {
-            stopGps()
-            startGps()
+            stopGps(); startGps()
             gpsKeepaliveHandler.postDelayed(this, prefs.gpsKeepaliveSeconds * 1000L)
+        }
+    }
+
+    // --- Speed limit fetch (every 15 seconds when speed >= 20 km/h) ---
+    private val speedLimitHandler  = Handler(Looper.getMainLooper())
+    private val speedLimitRunnable = object : Runnable {
+        override fun run() {
+            // Log.d(TAG, "speedLimitRunnable fired — speed=${textView.speedKmh} keyEmpty=${prefs.hereApiKey.isEmpty()}")
+            if (textView.speedKmh >= 20f && prefs.hereApiKey.isNotEmpty()) {
+                fetchSpeedLimit(currentLat, currentLon)
+            } else if (textView.speedKmh < 20f) {
+                textView.speedLimitKmh = 0
+            }
+            speedLimitHandler.postDelayed(this, 15_000)
         }
     }
 
@@ -102,22 +121,18 @@ class OverlayService : Service() {
     private val locationReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             if (intent.action != ACTION_LOCATION_UPDATE) return
-
             val location: Location? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableExtra(LocationManager.KEY_LOCATION_CHANGED, Location::class.java)
             } else {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(LocationManager.KEY_LOCATION_CHANGED)
             }
-
             location?.let {
                 val kmh = if (it.hasSpeed()) it.speed * 3.6f else 0f
                 textView.speedKmh = kmh.coerceAtLeast(0f)
-
-                // Keep last known bearing — only overwrite when GPS reports a fresh value
+                currentLat = it.latitude
+                currentLon = it.longitude
                 if (it.hasBearing()) textView.bearing = it.bearing
-
-                // Auto-hide: hide after 2 minutes below 5 km/h; restore immediately above 5
                 if (kmh >= 5f) {
                     if (hideScheduled) {
                         autoHideHandler.removeCallbacks(autoHideRunnable)
@@ -161,32 +176,28 @@ class OverlayService : Service() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         buildTextWindow()
 
-        // Initialise arrow to NW so it is visible before GPS delivers a bearing fix
         textView.bearing = BEARING_FALLBACK
 
-        // Speed is zero at boot — start the auto-hide countdown immediately
         autoHideHandler.postDelayed(autoHideRunnable, 2 * 60 * 1000L)
         hideScheduled = true
 
         //startTestLoop()
         startGps()
         gpsKeepaliveHandler.postDelayed(gpsKeepaliveRunnable, prefs.gpsKeepaliveSeconds * 1000L)
+        speedLimitHandler.postDelayed(speedLimitRunnable, 15_000)
 
         val filter = IntentFilter().apply {
-            addAction(ACTION_ENTER_SETTINGS)
-            addAction(ACTION_EXIT_SETTINGS)
-            addAction(ACTION_UPDATE_PREFS)
-            addAction(ACTION_RESIZE)
+            addAction(ACTION_ENTER_SETTINGS); addAction(ACTION_EXIT_SETTINGS)
+            addAction(ACTION_UPDATE_PREFS);   addAction(ACTION_RESIZE)
             addAction(ACTION_MOVE)
         }
         registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
         registerReceiver(locationReceiver, IntentFilter(ACTION_LOCATION_UPDATE), RECEIVER_EXPORTED)
+
+        // Log.d(TAG, "OverlayService started — hereApiKey length=${prefs.hereApiKey.length}")
     }
 
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-        stopSelf()
-    }
+    override fun onTaskRemoved(rootIntent: Intent?) { super.onTaskRemoved(rootIntent); stopSelf() }
 
     override fun onDestroy() {
         super.onDestroy()
@@ -195,6 +206,7 @@ class OverlayService : Service() {
         stopGps()
         gpsKeepaliveHandler.removeCallbacks(gpsKeepaliveRunnable)
         autoHideHandler.removeCallbacks(autoHideRunnable)
+        speedLimitHandler.removeCallbacks(speedLimitRunnable)
         unregisterReceiver(receiver)
         unregisterReceiver(locationReceiver)
         try { windowManager.removeView(textView) } catch (_: Exception) {}
@@ -206,16 +218,12 @@ class OverlayService : Service() {
     private fun buildTextWindow() {
         textView = SpeedOverlayView(this)
         applyPrefs()
-
         val (initWidth, initHeight) = calcOverlaySize(prefs.textSizePx)
-
         val dm = resources.displayMetrics
         prefs.overlayX = prefs.overlayX.coerceIn(0, (dm.widthPixels  - initWidth ).coerceAtLeast(0))
         prefs.overlayY = prefs.overlayY.coerceIn(0, (dm.heightPixels - initHeight).coerceAtLeast(0))
-
         textParams = WindowManager.LayoutParams(
-            initWidth, initHeight,
-            prefs.overlayX, prefs.overlayY,
+            initWidth, initHeight, prefs.overlayX, prefs.overlayY,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE  or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE  or
@@ -223,10 +231,7 @@ class OverlayService : Service() {
                     WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
-
         windowManager.addView(textView, textParams)
-
-        // alpha = 0.5f is the MIUI click-through threshold for TYPE_APPLICATION_OVERLAY
         textParams.alpha = 0.5f
         windowManager.updateViewLayout(textView, textParams)
     }
@@ -241,26 +246,23 @@ class OverlayService : Service() {
 
     private fun resizeOverlay(scaleFactor: Float) {
         val dm = resources.displayMetrics
-
-        val testPaint = Paint().apply { textSize = 800f }
-        val maxSizeByWidth = dm.widthPixels /
-                ((testPaint.measureText("1") + testPaint.measureText("00") + 800f * 0.08f) / 800f)
+        val testPaint      = Paint().apply { textSize = 800f }
+        val testArrowH     = 800f * 0.38f
+        val testLimitPaint = Paint().apply { textSize = testArrowH * 0.75f }
+        val testBottom     = testArrowH * 2.5f + testLimitPaint.measureText("199") / 2f
+        val testNumber     = testPaint.measureText("1") + testPaint.measureText("00") + 800f * 0.08f
+        val maxSizeByWidth = dm.widthPixels / (maxOf(testNumber, testBottom) / 800f)
 
         val newSize = (prefs.textSizePx * scaleFactor).coerceIn(40f, maxSizeByWidth)
         prefs.textSizePx    = newSize
         textView.textSizePx = newSize
 
         val (w, h) = calcOverlaySize(newSize)
-        textParams.width    = w
-        textParams.height   = h
-        prefs.overlayWidth  = w
-        prefs.overlayHeight = h
-
+        textParams.width  = w;  textParams.height = h
+        prefs.overlayWidth = w; prefs.overlayHeight = h
         textParams.x = textParams.x.coerceIn(0, (dm.widthPixels  - w).coerceAtLeast(0))
         textParams.y = textParams.y.coerceIn(0, (dm.heightPixels - h).coerceAtLeast(0))
-        prefs.overlayX = textParams.x
-        prefs.overlayY = textParams.y
-
+        prefs.overlayX = textParams.x; prefs.overlayY = textParams.y
         windowManager.updateViewLayout(textView, textParams)
     }
 
@@ -272,29 +274,83 @@ class OverlayService : Service() {
 
     private fun exitSettingsMode() {
         isInSettingsMode = false
-
-        // Fall back to NW if GPS has not yet delivered a bearing
         if (textView.bearing == null) textView.bearing = BEARING_FALLBACK
-
-        // Always show overlay when leaving settings — user needs visual feedback
-        isAutoHidden = false
-        textParams.alpha = 0.5f
+        textParams.alpha = if (isAutoHidden) 0f else 0.5f
         windowManager.updateViewLayout(textView, textParams)
-
-        // Start a fresh 2-minute countdown regardless of current speed
-        autoHideHandler.removeCallbacks(autoHideRunnable)
-        autoHideHandler.postDelayed(autoHideRunnable, 2 * 60 * 1000L)
-        hideScheduled = true
+        if (!hideScheduled && !isAutoHidden) {
+            autoHideHandler.postDelayed(autoHideRunnable, 2 * 60 * 1000L)
+            hideScheduled = true
+        }
     }
 
     private fun calcOverlaySize(sizePx: Float): Pair<Int, Int> {
         val paint = Paint().apply { textSize = sizePx }
-        val w     = (paint.measureText("1") + paint.measureText("00") + sizePx * 0.08f).toInt()
-        val fm    = paint.fontMetrics
-        val arrowH   = sizePx * 0.38f
-        val arrowGap = arrowH * 0.3f
-        val h = (fm.bottom - fm.top + sizePx * 0.05f + arrowGap + arrowH + sizePx * 0.05f).toInt()
+        val numberWidth = paint.measureText("1") + paint.measureText("00") + sizePx * 0.08f
+        val arrowH      = sizePx * 0.38f
+        val arrowGap    = arrowH * 0.3f
+        val limitPaint  = Paint().apply { textSize = arrowH * 0.75f }
+        val bottomWidth = arrowH * 2.5f + limitPaint.measureText("199") / 2f
+        val w  = maxOf(numberWidth, bottomWidth).toInt()
+        val fm = paint.fontMetrics
+        val h  = (fm.bottom - fm.top + sizePx * 0.05f + arrowGap + arrowH + sizePx * 0.05f).toInt()
         return Pair(w, h)
+    }
+
+    // --- HERE speed limit fetch ---
+    private fun fetchSpeedLimit(lat: Double, lon: Double) {
+        // Log.d(TAG, "fetchSpeedLimit called — lat=$lat lon=$lon key=${prefs.hereApiKey.take(8)}...")
+        Thread {
+            try {
+                val url = java.net.URL(
+                    "https://router.hereapi.com/v8/routes?" +
+                            "origin=$lat,$lon&" +
+                            "destination=${lat + 0.0001},$lon&" +
+                            "transportMode=car&" +
+                            "return=polyline&" +
+                            "spans=speedLimit&" +
+                            "apiKey=${prefs.hereApiKey}"
+                )
+                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn.requestMethod  = "GET"
+                conn.connectTimeout = 5000
+                conn.readTimeout    = 5000
+
+                val code = conn.responseCode
+                // Log.d(TAG, "HTTP response code: $code")
+
+                if (code == 200) {
+                    val json = conn.inputStream.bufferedReader().readText()
+                    // Log.d(TAG, "Response: ${json.take(1000)}")
+                    val limit = parseSpeedLimit(json)
+                    // Log.d(TAG, "Parsed limit: $limit km/h")
+                    Handler(Looper.getMainLooper()).post { textView.speedLimitKmh = limit }
+                } else {
+                    val err = conn.errorStream?.bufferedReader()?.readText() ?: "no error body"
+                    Log.e(TAG, "Error response ($code): $err")
+                }
+                conn.disconnect()
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception in fetchSpeedLimit: ${e.message}", e)
+            }
+        }.start()
+    }
+
+    private fun parseSpeedLimit(json: String): Int {
+        return try {
+            val routes   = JSONObject(json).getJSONArray("routes")
+            if (routes.length() == 0) return 0
+            val sections = routes.getJSONObject(0).getJSONArray("sections")
+            if (sections.length() == 0) return 0
+            val spans    = sections.getJSONObject(0).getJSONArray("spans")
+            if (spans.length() == 0) return 0
+            // speedLimit is a direct number (m/s), not a nested object
+            val valueMs = spans.getJSONObject(0).optDouble("speedLimit", 0.0)
+            if (valueMs == 0.0) return 0
+            (valueMs * 3.6).toInt()
+        } catch (e: Exception) {
+            Log.e(TAG, "parseSpeedLimit exception: ${e.message}")
+            0
+        }
     }
 
     @SuppressLint("MissingPermission")

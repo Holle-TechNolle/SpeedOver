@@ -24,4 +24,6 @@ class Prefs(context: Context) {
     var overlayHeight:Int   get() = sp.getInt("overlay_h",    280);           set(v) = sp.edit().putInt("overlay_h",    v).apply()
     var fontName:     String get() = sp.getString("font_name", "segoe") ?: "segoe"; set(v) = sp.edit().putString("font_name", v).apply()
     var gpsKeepaliveSeconds: Int get() = sp.getInt("gps_keepalive", 30); set(v) = sp.edit().putInt("gps_keepalive", v).apply()
+    var hereApiKey: String get() = sp.getString("here_api_key", "") ?: ""; set(v) = sp.edit().putString("here_api_key", v).apply()
+    var hereAppId:  String get() = sp.getString("here_app_id",  "") ?: "Duh5p82gwuN9ZCZlgGSV"; set(v) = sp.edit().putString("here_app_id",  v).apply()
 }
