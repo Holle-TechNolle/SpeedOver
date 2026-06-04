@@ -527,7 +527,9 @@ class OverlayPreviewView(
 
         // Speed limit centre mirrors arrow centre relative to nx
         val limitFontSize = arrowH * 0.75f
-        val limitCenterX = nx - arrowH * 2.5f
+        // talLim centre: arrowH*1.25f from overlay left edge (mirrors arrow from right)
+        val overlayLeftX = prefs.overlayX * scale
+        val limitCenterX = overlayLeftX + arrowH * 1.25f
         limitFill.apply {
             textSize = limitFontSize; color = prefs.fillColor; alpha = prefs.textAlpha
             textAlign = Paint.Align.CENTER

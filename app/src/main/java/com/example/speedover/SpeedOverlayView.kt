@@ -1,4 +1,5 @@
-﻿package com.example.speedover
+﻿// SpeedOverlayView.kt
+package com.example.speedover
 
 import android.content.Context
 import android.graphics.*
@@ -9,23 +10,12 @@ import android.view.View
  * SpeedOver Safety Awareness
  * Holle TechNolle, 2026
  *
- * Custom view that draws:
- *   - Speed number (top, right-aligned)
- *   - Speed limit (bottom-left, same colours and opacity as speed)
- *   - Direction arrow (bottom-right, inset so it never clips when rotated)
- *
- * Speed limit shows "00" when no data is available or speed is below threshold.
- * Arrow is hidden until GPS delivers a bearing; shows NW fallback after init.
- * Pinch-to-resize is handled at Activity level (MainActivity).
+ * Draws the speed number, speed limit and direction arrow.
+ * ViolationGradient lives entirely in OverlayService / ViolationView.
  *
  * Personal use only. Untested. Built for Xiaomi T10 — may work on other devices.
  */
 class SpeedOverlayView(context: Context) : View(context) {
-
-    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-    }
 
     var speedKmh: Float = 0f
         set(value) { field = value; invalidate() }
@@ -87,7 +77,7 @@ class SpeedOverlayView(context: Context) : View(context) {
         style = Paint.Style.STROKE
     }
 
-    // --- Arrow paints ---
+    // --- Direction arrow paints ---
     private val arrowFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
     }
@@ -99,46 +89,39 @@ class SpeedOverlayView(context: Context) : View(context) {
 
     private var pointerDownX = 0f
     private var pointerDownY = 0f
-    private var isDragging = false
+    private var isDragging   = false
     private val longPressRunnable = Runnable { onLongPress?.invoke() }
 
     override fun onDraw(canvas: Canvas) {
+
         // --- Speed number ---
         val text = speedKmh.toInt().toString()
-        fillPaint.apply {
-            textSize = textSizePx; color = fillColor; alpha = textAlpha
-        }
-        strokePaint.apply {
-            textSize = textSizePx; color = strokeColor; alpha = textAlpha
-            strokeWidth = strokeWidthFactor
-        }
-        val x = width.toFloat()
-        val bounds = Rect()
-        fillPaint.getTextBounds(text, 0, text.length, bounds)
-        // Use font metrics instead of actual glyph bounds so position never shifts between digits
+        fillPaint.apply   { textSize = textSizePx; color = fillColor;   alpha = textAlpha }
+        strokePaint.apply { textSize = textSizePx; color = strokeColor; alpha = textAlpha; strokeWidth = strokeWidthFactor }
+
+        val x  = width.toFloat()
         val fm = fillPaint.fontMetrics
+        // Use font metrics for stable vertical position regardless of which digits are shown
         val numberY = -fm.ascent + textSizePx * 0.05f
         canvas.drawText(text, x, numberY, strokePaint)
         canvas.drawText(text, x, numberY, fillPaint)
 
-        // --- Shared geometry for bottom row ---
-        val arrowH   = textSizePx * 0.38f
-        val indentD  = arrowH * 0.28f
-        val inset    = arrowH * 0.75f   // keeps rotated corners inside the view
-        val right    = width.toFloat() - inset
-        val left     = right - arrowH
-        val top = numberY + (-fm.ascent + fm.descent) * 0.05f + arrowH * 0.3f
-        val bottom   = top + arrowH
-        val cx       = (left + right) / 2f
-        val cy       = (top + bottom) / 2f
+        // --- Shared bottom-row geometry ---
+        val arrowH  = textSizePx * 0.38f
+        val indentD = arrowH * 0.28f
+        val inset   = arrowH * 0.75f   // keeps rotated arrow corners inside the view
+        val right   = width.toFloat() - inset
+        val left    = right - arrowH
+        val top     = numberY + (-fm.ascent + fm.descent) * 0.05f + arrowH * 0.3f
+        val bottom  = top + arrowH
+        val cx      = (left + right) / 2f
+        val cy      = (top + bottom) / 2f
 
-        // --- Speed limit (always drawn, left of arrow zone) ---
-        val limitText      = if (speedLimitKmh > 0) speedLimitKmh.toString() else "00"
-        val limitFontSize  = arrowH * 0.75f
-        val limitGap       = arrowH * 0.15f
-        // Mirror arrow centre relative to right edge:
-        // xArrowCentre = width - arrowH*1.25f  →  xLimitCentre = width - arrowH*2.5f
-        val limitCenterX = width.toFloat() - arrowH * 2.5f
+        // --- Speed limit ---
+        // Centred at arrowH*1.25f from left — mirrors the arrow's distance from the right edge
+        val limitText     = if (speedLimitKmh > 0) speedLimitKmh.toString() else "00"
+        val limitFontSize = arrowH * 0.75f
+        val limitCenterX  = arrowH * 1.25f
 
         limitFillPaint.apply {
             textSize = limitFontSize; color = fillColor; alpha = textAlpha
@@ -147,43 +130,26 @@ class SpeedOverlayView(context: Context) : View(context) {
             textSize = limitFontSize; color = strokeColor; alpha = textAlpha
             strokeWidth = strokeWidthFactor * 0.5f
         }
+
         val limitBounds = Rect()
         limitFillPaint.getTextBounds(limitText, 0, limitText.length, limitBounds)
         val limitY = cy + limitBounds.height() / 2f - limitBounds.bottom
         canvas.drawText(limitText, limitCenterX, limitY, limitStrokePaint)
         canvas.drawText(limitText, limitCenterX, limitY, limitFillPaint)
 
-        // Underline — shown when speed exceeds limit + 2, grows left-to-right up to limit*1.3 + 2
-        if (speedLimitKmh > 0) {
-            val lowerBound = speedLimitKmh + 2f
-            val upperBound = speedLimitKmh * 1.3f + 2f
-
-            if (speedKmh > lowerBound) {
-                val progress    = ((speedKmh - lowerBound) / (upperBound - lowerBound)).coerceIn(0f, 1f)
-                val boxWidth    = limitFillPaint.measureText("199")
-                val lineLeft    = limitCenterX - boxWidth / 2f
-                val lineRight   = lineLeft + progress * boxWidth
-                val lineY       = limitY + limitFontSize * 0.18f
-
-                linePaint.apply {
-                    color       = strokeColor
-                    alpha       = textAlpha
-                    strokeWidth = strokeWidthFactor * 0.5f
-                }
-                canvas.drawLine(lineLeft, lineY, lineRight, lineY, linePaint)
-            }
-        }
-
-        // --- Direction arrow (only when bearing is available) ---
+        // --- Direction arrow ---
+        // Shown as soon as GPS delivers a bearing; falls back to NW at init
         bearing?.let { b ->
             val path = Path().apply {
                 moveTo(cx, top)               // tip — points north at bearing 0°
                 lineTo(right, bottom)          // back-right
-                lineTo(cx, bottom - indentD)   // back indent
+                lineTo(cx, bottom - indentD)   // concave back indent
                 lineTo(left, bottom)           // back-left
                 close()
             }
-            arrowFillPaint.apply   { color = fillColor;   alpha = textAlpha }
+            arrowFillPaint.apply {
+                color = fillColor; alpha = textAlpha
+            }
             arrowStrokePaint.apply {
                 color = strokeColor; alpha = textAlpha
                 strokeWidth = strokeWidthFactor * 0.5f

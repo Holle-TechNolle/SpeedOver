@@ -1,4 +1,5 @@
-﻿package com.example.speedover
+﻿// OverlayService.kt
+package com.example.speedover
 
 import android.annotation.SuppressLint
 import android.app.*
@@ -11,25 +12,31 @@ import android.util.Log
 import android.view.*
 import androidx.core.app.NotificationCompat
 import org.json.JSONObject
+import kotlin.math.roundToInt
 
 /**
  * SpeedOver Safety Awareness
  * Holle TechNolle, 2026
  *
- * Foreground service that owns the overlay window and GPS pipeline.
+ * Manages two overlay windows:
  *
- * Architecture:
- *   - Single TYPE_APPLICATION_OVERLAY window (textView) — always FLAG_NOT_TOUCHABLE,
- *     so all touches pass through to the app beneath (MIUI-safe via alpha = 0.5f trick).
- *   - GPS delivered via PendingIntent rather than LocationListener, which is more
- *     resilient to MIUI background throttling.
- *   - GPS keepalive handler re-registers GPS every N seconds as an additional safeguard.
- *   - Speed limit fetched from HERE Routing API v8 every 15 seconds when speed >= 20 km/h.
- *     Shows "00" when below threshold or when no HERE API key is configured.
- *   - Screen kept on via FLAG_KEEP_SCREEN_ON + SCREEN_DIM_WAKE_LOCK.
- *   - Auto-hide: overlay hidden after 2 minutes below 5 km/h, restored above 5 km/h.
- *   - Arrow initialised to NW (315°) at boot and on settings exit so it is always
- *     visible before GPS delivers its first bearing fix.
+ *   textView       — speed number, speed limit, direction arrow.
+ *                    Always FLAG_NOT_TOUCHABLE. MIUI click-through via alpha = 0.5f.
+ *                    Locked to alpha = 1.0f (not click-through) when violation > 10%.
+ *
+ *   violationView  — ViolationGradient: yellow→red thermometer bar, left side of screen.
+ *                    Fixed position and size — independent of user text-size settings.
+ *                    Always fully opaque (alpha = 1.0f) when visible: safety element.
+ *
+ * ViolationGradient visibility rules:
+ *   speed <= limit + 3 km/h  →  hidden (3 km/h = Danish enforcement tolerance)
+ *   speed >  limit + 3 km/h  →  shown, grows bottom-to-top up to 30% overspeed
+ *   violation > 10%           →  textView also locked to alpha = 1.0f
+ *
+ * GPS via PendingIntent — resilient to MIUI background throttling.
+ * Speed limit from HERE Routing API v8 every 5 seconds when speed >= 20 km/h.
+ * Screen kept on via FLAG_KEEP_SCREEN_ON + SCREEN_DIM_WAKE_LOCK.
+ * Auto-hide: both windows hidden after 2 minutes below 5 km/h.
  *
  * Personal use only. Untested. Built for Xiaomi T10 — may work on other devices.
  */
@@ -43,7 +50,7 @@ class OverlayService : Service() {
         const val ACTION_MOVE            = "com.example.speedover.MOVE"
         const val ACTION_LOCATION_UPDATE = "com.example.speedover.LOCATION_UPDATE"
         const val CHANNEL_ID             = "SpeedOverChannel"
-        const val BEARING_FALLBACK       = 315f
+        const val BEARING_FALLBACK       = 315f   // NW — shown before GPS delivers a bearing
         const val TAG                    = "SpeedOver"
 
         var isRunning = false
@@ -54,11 +61,15 @@ class OverlayService : Service() {
     private lateinit var locationManager: LocationManager
     private lateinit var wakeLock: PowerManager.WakeLock
 
+    // Window 1 — speed number, speed limit, direction arrow
     private lateinit var textView: SpeedOverlayView
     private lateinit var textParams: WindowManager.LayoutParams
 
-    private var locationPendingIntent: PendingIntent? = null
+    // Window 2 — ViolationGradient bar (fixed size, left side of screen)
+    private lateinit var violationView: ViolationView
+    private lateinit var violationParams: WindowManager.LayoutParams
 
+    private var locationPendingIntent: PendingIntent? = null
     private var currentLat = 0.0
     private var currentLon = 0.0
 
@@ -69,11 +80,14 @@ class OverlayService : Service() {
 
     private val autoHideHandler  = Handler(Looper.getMainLooper())
     private val autoHideRunnable = Runnable {
+        // After 2 minutes below 5 km/h, hide both windows
         isAutoHidden  = true
         hideScheduled = false
         if (!isInSettingsMode) {
-            textParams.alpha = 0f
+            textParams.alpha      = 0f
+            violationParams.alpha = 0f
             windowManager.updateViewLayout(textView, textParams)
+            windowManager.updateViewLayout(violationView, violationParams)
         }
     }
 
@@ -81,22 +95,20 @@ class OverlayService : Service() {
     private val gpsKeepaliveHandler  = Handler(Looper.getMainLooper())
     private val gpsKeepaliveRunnable = object : Runnable {
         override fun run() {
+            // Re-register GPS to prevent MIUI silently throttling delivery
             stopGps(); startGps()
             gpsKeepaliveHandler.postDelayed(this, prefs.gpsKeepaliveSeconds * 1000L)
         }
     }
 
-    // --- Speed limit fetch (every 15 seconds when speed >= 20 km/h) ---
+    // --- Speed limit fetch (every 1 seconds when speed >= 20 km/h) ---
     private val speedLimitHandler  = Handler(Looper.getMainLooper())
     private val speedLimitRunnable = object : Runnable {
         override fun run() {
-            // Log.d(TAG, "speedLimitRunnable fired — speed=${textView.speedKmh} keyEmpty=${prefs.hereApiKey.isEmpty()}")
             if (textView.speedKmh >= 20f && prefs.hereApiKey.isNotEmpty()) {
                 fetchSpeedLimit(currentLat, currentLon)
-            } else if (textView.speedKmh < 20f) {
-                textView.speedLimitKmh = 0
             }
-            speedLimitHandler.postDelayed(this, 15_000)
+            speedLimitHandler.postDelayed(this, 2_000)
         }
     }
 
@@ -132,7 +144,11 @@ class OverlayService : Service() {
                 textView.speedKmh = kmh.coerceAtLeast(0f)
                 currentLat = it.latitude
                 currentLon = it.longitude
+
+                // Keep last known bearing — only update when GPS reports a fresh value
                 if (it.hasBearing()) textView.bearing = it.bearing
+
+                // Auto-hide: restore when speed climbs back above 5 km/h
                 if (kmh >= 5f) {
                     if (hideScheduled) {
                         autoHideHandler.removeCallbacks(autoHideRunnable)
@@ -141,6 +157,7 @@ class OverlayService : Service() {
                     if (isAutoHidden) {
                         isAutoHidden = false
                         if (!isInSettingsMode) {
+                            // Restore textView — violationView alpha set by updateViolationView below
                             textParams.alpha = 0.5f
                             windowManager.updateViewLayout(textView, textParams)
                         }
@@ -151,6 +168,9 @@ class OverlayService : Service() {
                         hideScheduled = true
                     }
                 }
+
+                // Update violation gradient with current speed and limit
+                updateViolationView(kmh, textView.speedLimitKmh)
             }
         }
     }
@@ -166,6 +186,7 @@ class OverlayService : Service() {
         createNotificationChannel()
         startForeground(1, buildNotification())
 
+        // SCREEN_DIM_WAKE_LOCK keeps screen on as backup if FLAG_KEEP_SCREEN_ON is ignored by MIUI
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(
             PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE,
@@ -175,16 +196,19 @@ class OverlayService : Service() {
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         buildTextWindow()
+        buildViolationWindow()
 
+        // Initialise arrow to NW — visible before GPS delivers its first bearing
         textView.bearing = BEARING_FALLBACK
 
+        // Start auto-hide countdown — speed is zero until GPS delivers its first fix
         autoHideHandler.postDelayed(autoHideRunnable, 2 * 60 * 1000L)
         hideScheduled = true
 
-        //startTestLoop()
+        // startTestLoop()  — uncomment to activate breath test for vioGrad
         startGps()
         gpsKeepaliveHandler.postDelayed(gpsKeepaliveRunnable, prefs.gpsKeepaliveSeconds * 1000L)
-        speedLimitHandler.postDelayed(speedLimitRunnable, 15_000)
+        speedLimitHandler.postDelayed(speedLimitRunnable, 5_000)
 
         val filter = IntentFilter().apply {
             addAction(ACTION_ENTER_SETTINGS); addAction(ACTION_EXIT_SETTINGS)
@@ -194,7 +218,7 @@ class OverlayService : Service() {
         registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
         registerReceiver(locationReceiver, IntentFilter(ACTION_LOCATION_UPDATE), RECEIVER_EXPORTED)
 
-        // Log.d(TAG, "OverlayService started — hereApiKey length=${prefs.hereApiKey.length}")
+        Log.d(TAG, "OverlayService started — hereApiKey length=${prefs.hereApiKey.length}")
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) { super.onTaskRemoved(rootIntent); stopSelf() }
@@ -207,14 +231,16 @@ class OverlayService : Service() {
         gpsKeepaliveHandler.removeCallbacks(gpsKeepaliveRunnable)
         autoHideHandler.removeCallbacks(autoHideRunnable)
         speedLimitHandler.removeCallbacks(speedLimitRunnable)
+        testHandler?.removeCallbacksAndMessages(null)
         unregisterReceiver(receiver)
         unregisterReceiver(locationReceiver)
-        try { windowManager.removeView(textView) } catch (_: Exception) {}
+        try { windowManager.removeView(textView)      } catch (_: Exception) {}
+        try { windowManager.removeView(violationView) } catch (_: Exception) {}
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // --- Overlay window ---
+    // --- Text window ---
     private fun buildTextWindow() {
         textView = SpeedOverlayView(this)
         applyPrefs()
@@ -232,7 +258,65 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
         windowManager.addView(textView, textParams)
+        // 0.5f = MIUI click-through threshold for TYPE_APPLICATION_OVERLAY
         textParams.alpha = 0.5f
+        windowManager.updateViewLayout(textView, textParams)
+    }
+
+    // --- Violation gradient window ---
+    // Fixed position and size — independent of user text-size settings.
+    // Left side of screen, spanning 25%-75% of screen height.
+    private fun buildViolationWindow() {
+        val dm = resources.displayMetrics
+        val vx = (dm.widthPixels  * 0.02f).toInt()   // 2% margin from left edge
+        val vy = (dm.heightPixels * 0.25f).toInt()   // top at 25% of screen height
+        val vw = (dm.widthPixels  * 0.10f).toInt()   // 10% of screen width
+        val vh = (dm.heightPixels * 0.50f).toInt()   // 50% height → bottom at 75%
+
+        violationView = ViolationView(this)
+        violationParams = WindowManager.LayoutParams(
+            vw, vh, vx, vy,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE  or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE  or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        windowManager.addView(violationView, violationParams)
+        // Start hidden — shown only when violation threshold is exceeded
+        violationParams.alpha = 0f
+        windowManager.updateViewLayout(violationView, violationParams)
+    }
+
+    // --- ViolationGradient logic ---
+    // Called on every GPS update with current speed and speed limit.
+    private fun updateViolationView(speedKmh: Float, limitKmh: Int) {
+        if (isAutoHidden || isInSettingsMode) return
+
+        // 3 km/h tolerance — reflects Danish enforcement measurement margin
+        if (limitKmh <= 0 || speedKmh <= limitKmh + 3f) {
+            // Below threshold: hide vioGrad, restore normal text alpha
+            violationView.progress = 0f
+            violationParams.alpha  = 0f
+            textParams.alpha       = 0.5f
+            windowManager.updateViewLayout(violationView, violationParams)
+            windowManager.updateViewLayout(textView, textParams)
+            return
+        }
+
+        // Violation fraction: 0.03 = 3% over limit, 0.10 = 10%, 0.30 = 30%
+        val violation = (speedKmh - limitKmh) / limitKmh
+
+        // Bar fills linearly: 0% at threshold (3 km/h over), 100% at 30% over
+        violationView.progress = (violation / 0.30f).coerceIn(0f, 1f)
+
+        // vioGrad always fully opaque — safety element
+        violationParams.alpha = 1.0f
+        windowManager.updateViewLayout(violationView, violationParams)
+
+        // > 10% over: lock textView fully opaque — strong signal to slow down
+        // 0-10% over: keep normal click-through alpha
+        textParams.alpha = if (violation > 0.10f) 1.0f else 0.5f
         windowManager.updateViewLayout(textView, textParams)
     }
 
@@ -249,7 +333,7 @@ class OverlayService : Service() {
         val testPaint      = Paint().apply { textSize = 800f }
         val testArrowH     = 800f * 0.38f
         val testLimitPaint = Paint().apply { textSize = testArrowH * 0.75f }
-        val testBottom     = testArrowH * 2.5f + testLimitPaint.measureText("199") / 2f
+        val testBottom     = testArrowH * 1.25f + testLimitPaint.measureText("199") / 2f + testArrowH * 1.75f
         val testNumber     = testPaint.measureText("1") + testPaint.measureText("00") + 800f * 0.08f
         val maxSizeByWidth = dm.widthPixels / (maxOf(testNumber, testBottom) / 800f)
 
@@ -268,15 +352,20 @@ class OverlayService : Service() {
 
     private fun enterSettingsMode() {
         isInSettingsMode = true
-        textParams.alpha = 0f
+        // Hide both windows while settings are open
+        textParams.alpha      = 0f
+        violationParams.alpha = 0f
         windowManager.updateViewLayout(textView, textParams)
+        windowManager.updateViewLayout(violationView, violationParams)
     }
 
     private fun exitSettingsMode() {
         isInSettingsMode = false
         if (textView.bearing == null) textView.bearing = BEARING_FALLBACK
+        // Restore textView — violation state will be corrected by next GPS update
         textParams.alpha = if (isAutoHidden) 0f else 0.5f
         windowManager.updateViewLayout(textView, textParams)
+        // Start fresh auto-hide countdown when returning from settings
         if (!hideScheduled && !isAutoHidden) {
             autoHideHandler.postDelayed(autoHideRunnable, 2 * 60 * 1000L)
             hideScheduled = true
@@ -289,7 +378,8 @@ class OverlayService : Service() {
         val arrowH      = sizePx * 0.38f
         val arrowGap    = arrowH * 0.3f
         val limitPaint  = Paint().apply { textSize = arrowH * 0.75f }
-        val bottomWidth = arrowH * 2.5f + limitPaint.measureText("199") / 2f
+        // talLim centre at arrowH*1.25f from left, arrow zone = arrowH*1.75f from right
+        val bottomWidth = arrowH * 1.25f + limitPaint.measureText("199") / 2f + arrowH * 1.75f
         val w  = maxOf(numberWidth, bottomWidth).toInt()
         val fm = paint.fontMetrics
         val h  = (fm.bottom - fm.top + sizePx * 0.05f + arrowGap + arrowH + sizePx * 0.05f).toInt()
@@ -298,7 +388,6 @@ class OverlayService : Service() {
 
     // --- HERE speed limit fetch ---
     private fun fetchSpeedLimit(lat: Double, lon: Double) {
-        // Log.d(TAG, "fetchSpeedLimit called — lat=$lat lon=$lon key=${prefs.hereApiKey.take(8)}...")
         Thread {
             try {
                 val url = java.net.URL(
@@ -311,26 +400,16 @@ class OverlayService : Service() {
                             "apiKey=${prefs.hereApiKey}"
                 )
                 val conn = url.openConnection() as java.net.HttpURLConnection
-                conn.requestMethod  = "GET"
-                conn.connectTimeout = 5000
-                conn.readTimeout    = 5000
-
-                val code = conn.responseCode
-                // Log.d(TAG, "HTTP response code: $code")
-
-                if (code == 200) {
-                    val json = conn.inputStream.bufferedReader().readText()
-                    // Log.d(TAG, "Response: ${json.take(1000)}")
-                    val limit = parseSpeedLimit(json)
-                    // Log.d(TAG, "Parsed limit: $limit km/h")
+                conn.requestMethod = "GET"; conn.connectTimeout = 5000; conn.readTimeout = 5000
+                if (conn.responseCode == 200) {
+                    val limit = parseSpeedLimit(conn.inputStream.bufferedReader().readText())
                     Handler(Looper.getMainLooper()).post { textView.speedLimitKmh = limit }
                 } else {
-                    val err = conn.errorStream?.bufferedReader()?.readText() ?: "no error body"
-                    Log.e(TAG, "Error response ($code): $err")
+                    Log.e(TAG, "HERE error (${conn.responseCode}): ${conn.errorStream?.bufferedReader()?.readText()}")
                 }
                 conn.disconnect()
             } catch (e: Exception) {
-                Log.e(TAG, "Exception in fetchSpeedLimit: ${e.message}", e)
+                Log.e(TAG, "fetchSpeedLimit exception: ${e.message}", e)
             }
         }.start()
     }
@@ -343,10 +422,11 @@ class OverlayService : Service() {
             if (sections.length() == 0) return 0
             val spans    = sections.getJSONObject(0).getJSONArray("spans")
             if (spans.length() == 0) return 0
-            // speedLimit is a direct number (m/s), not a nested object
+            // speedLimit is m/s as a direct number — roundToInt avoids floating-point
+            // truncation errors (e.g. 36.111... * 3.6 = 129.999... → 130 with rounding)
             val valueMs = spans.getJSONObject(0).optDouble("speedLimit", 0.0)
             if (valueMs == 0.0) return 0
-            (valueMs * 3.6).toInt()
+            (valueMs * 3.6).roundToInt()
         } catch (e: Exception) {
             Log.e(TAG, "parseSpeedLimit exception: ${e.message}")
             0
@@ -390,15 +470,113 @@ class OverlayService : Service() {
             .build()
     }
 
+    // --- Breath test ---
+    // Oscillates vioGrad up and down over 5 seconds to verify rendering.
+    // Call startTestLoop() from onCreate() to activate. Remove before release.
     private fun startTestLoop() {
-        var toggle = false
+        val startTime = System.currentTimeMillis()
         testHandler = Handler(Looper.getMainLooper())
         testHandler?.post(object : Runnable {
             override fun run() {
-                textView.speedKmh = if (toggle) 1f else 0f
-                toggle = !toggle
-                testHandler?.postDelayed(this, 1000)
+                val phase = ((System.currentTimeMillis() - startTime) % 5000L).toFloat() / 5000f
+                // Triangle wave: 0→1 in first 2.5 s, 1→0 in next 2.5 s
+                val wave = if (phase < 0.5f) phase * 2f else (1f - phase) * 2f
+                val fakeLimit = 50f
+                val fakeSpeed = fakeLimit * (1f + wave * 0.35f)  // 50 → 67.5 km/h and back
+                updateViolationView(fakeSpeed, fakeLimit.toInt())
+                testHandler?.postDelayed(this, 50L)
             }
         })
+    }
+}
+
+// =============================================================================
+// ViolationGradient view
+// =============================================================================
+/**
+ * Draws the ViolationGradient — a thermometer-style bar with:
+ *   - Blue outline (RGB 0,0,255) showing full potential height at all times
+ *   - Horizontal tick marks: long at 10%/20% overspeed, short at 5%/15%/25%
+ *   - Yellow→red gradient fill growing from bottom upward
+ *   - Rounded corners
+ *
+ * progress = 0..1 where 1 = 30% overspeed (maximum fill)
+ */
+class ViolationView(context: Context) : View(context) {
+
+    // 0..1 — fill fraction from bottom upward
+    var progress: Float = 0f
+        set(value) { field = value; invalidate() }
+
+    // Physical stroke width: 2dp converted to device pixels
+    private val strokePx = 2f * resources.displayMetrics.density
+
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style       = Paint.Style.STROKE
+        color       = Color.rgb(0, 0, 255)
+        strokeJoin  = Paint.Join.ROUND
+        strokeCap   = Paint.Cap.ROUND
+    }
+    private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style       = Paint.Style.STROKE
+        color       = Color.rgb(0, 0, 255)
+        strokeCap   = Paint.Cap.ROUND
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        if (progress <= 0f) return
+
+        val w          = width.toFloat()
+        val h          = height.toFloat()
+        val halfStroke = strokePx / 2f
+        val radius     = w * 0.25f
+
+        // Rect inset by half stroke so outline sits fully inside the window
+        val rect = RectF(halfStroke, halfStroke, w - halfStroke, h - halfStroke)
+
+        // --- Gradient fill (grows from bottom upward) ---
+        val barTop = h - progress * (h - halfStroke * 2f) - halfStroke
+        fillPaint.shader = LinearGradient(
+            0f, halfStroke, 0f, h - halfStroke,
+            Color.RED, Color.YELLOW,
+            Shader.TileMode.CLAMP
+        )
+        // Clip to rounded rect before drawing fill so corners stay clean
+        canvas.save()
+        val clipPath = Path().apply {
+            addRoundRect(rect, radius, radius, Path.Direction.CW)
+        }
+        canvas.clipPath(clipPath)
+        canvas.drawRect(halfStroke, barTop, w - halfStroke, h - halfStroke, fillPaint)
+        canvas.restore()
+
+        // --- Tick marks ---
+        // The bar represents 0–30% overspeed.
+        // Long ticks at 10% and 20%; short ticks at 5%, 15%, 25%.
+        // Each tick's y position = bottom - (overspeed% / 30%) * barHeight
+        outlinePaint.strokeWidth = strokePx
+        tickPaint.strokeWidth    = strokePx
+
+        val barHeight  = h - halfStroke * 2f
+        val tickData   = listOf(
+            Pair(5f  / 30f, false),   //  5% — short
+            Pair(10f / 30f, true),    // 10% — long
+            Pair(15f / 30f, false),   // 15% — short
+            Pair(20f / 30f, true),    // 20% — long
+            Pair(25f / 30f, false)    // 25% — short
+        )
+        tickData.forEach { (fraction, isLong) ->
+            val tickY     = h - halfStroke - fraction * barHeight
+            val tickLeft  = if (isLong) w * 0.12f else w * 0.25f
+            val tickRight = if (isLong) w * 0.88f else w * 0.75f
+            canvas.drawLine(tickLeft, tickY, tickRight, tickY, tickPaint)
+        }
+
+        // --- Outline (drawn last so it sits on top of fill and ticks) ---
+        outlinePaint.strokeWidth = strokePx
+        canvas.drawRoundRect(rect, radius, radius, outlinePaint)
     }
 }
