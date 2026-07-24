@@ -1,4 +1,5 @@
-﻿package com.example.speedover
+﻿// MainActivity.kt
+package com.example.speedover
 
 import android.app.AlertDialog
 import android.content.Context
@@ -9,8 +10,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.text.Editable
-import android.text.TextWatcher
 import android.view.*
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,11 +21,6 @@ import androidx.appcompat.app.AppCompatActivity
  *
  * Entry point. Handles permissions, starts the overlay service,
  * and shows the settings UI when brought to the foreground from recents.
- *
- * The settings screen contains a live preview that cycles between a light and
- * a dark mock-up background every 3 seconds, so colour and opacity choices can
- * be evaluated against both typical app themes before locking them in.
- * The preview shows a demo speed (123), speed limit (80) and NW direction arrow.
  *
  * Personal use only. Untested. Built for Xiaomi T10 — may work on other devices.
  */
@@ -130,7 +124,23 @@ class MainActivity : AppCompatActivity() {
             return Triple(row, lbl, valTv)
         }
 
-        // Colour buttons side by side
+        fun switchRow(labelText: String, checked: Boolean, onChange: (Boolean) -> Unit): LinearLayout {
+            val lbl = TextView(this).apply {
+                text = labelText; setTextColor(Color.WHITE)
+                textSize = 11f; isAllCaps = true; letterSpacing = 0.08f
+            }
+            val sw = Switch(this).apply {
+                isChecked = checked
+                setOnCheckedChangeListener { _, v -> onChange(v) }
+            }
+            return LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL; setPadding(0, 12, 0, 4)
+                addView(lbl, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                addView(sw,  LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            }
+        }
+
+        // Colour
         controls.addView(label("Colour"))
         val colourRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val fillBtn = Button(this).apply {
@@ -189,23 +199,53 @@ class MainActivity : AppCompatActivity() {
             prefs.gpsKeepaliveSeconds = v; gpsVal.text = "$v sec"
         })
 
-        // HERE API key
-        controls.addView(label("HERE API key (speed limits)"))
-        controls.addView(EditText(this).apply {
-            setText(prefs.hereApiKey)
-            hint = "Paste your HERE API key here"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.rgb(80, 80, 80))
-            textSize = 11f
-            maxLines = 1
-            setBackgroundColor(Color.rgb(22, 22, 22))
-            setPadding(12, 10, 12, 10)
-            addTextChangedListener(object : TextWatcher {
-                override fun afterTextChanged(s: Editable?) { prefs.hereApiKey = s.toString().trim() }
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            })
+        // Speed limit update interval
+        val (limRow, _, limVal) = labelRow("Speed limit interval", "${prefs.speedLimitIntervalSeconds} sec")
+        controls.addView(limRow)
+        controls.addView(seekBar(prefs.speedLimitIntervalSeconds, 5, 60) { v ->
+            prefs.speedLimitIntervalSeconds = v; limVal.text = "$v sec"
         })
+
+        // Overpass query radius
+        val (radRow, _, radVal) = labelRow("Speed limit radius", "${prefs.overpassRadiusMeters} m")
+        controls.addView(radRow)
+        controls.addView(seekBar(prefs.overpassRadiusMeters, 10, 150) { v ->
+            prefs.overpassRadiusMeters = v; radVal.text = "$v m"
+        })
+
+        // Road info display toggles
+        controls.addView(label("Road info"))
+        controls.addView(switchRow("Show road name", prefs.showRoadName) { v ->
+            prefs.showRoadName = v
+            sendBroadcast(Intent(OverlayService.ACTION_UPDATE_PREFS).setPackage(packageName))
+        })
+        controls.addView(switchRow("Show road type", prefs.showRoadType) { v ->
+            prefs.showRoadType = v
+            sendBroadcast(Intent(OverlayService.ACTION_UPDATE_PREFS).setPackage(packageName))
+        })
+
+        // Speed limits by road type (OSM names, 0 = disabled)
+        controls.addView(label("Speed limits by road type  (0 = off)"))
+
+        fun speedLimitRow(osmName: String, current: Int, onSave: (Int) -> Unit) {
+            val (row, _, valTv) = labelRow(osmName, if (current == 0) "off" else "$current")
+            controls.addView(row)
+            controls.addView(seekBar(current, 0, 140) { v ->
+                valTv.text = if (v == 0) "off" else "$v"
+                onSave(v)
+            })
+        }
+
+        speedLimitRow("motorway",      prefs.limitMotorway)      { prefs.limitMotorway      = it }
+        speedLimitRow("motorway_link", prefs.limitMotorwayLink)  { prefs.limitMotorwayLink  = it }
+        speedLimitRow("trunk",         prefs.limitTrunk)         { prefs.limitTrunk         = it }
+        speedLimitRow("trunk_link",    prefs.limitTrunkLink)     { prefs.limitTrunkLink     = it }
+        speedLimitRow("primary",       prefs.limitPrimary)       { prefs.limitPrimary       = it }
+        speedLimitRow("secondary",     prefs.limitSecondary)     { prefs.limitSecondary     = it }
+        speedLimitRow("tertiary",      prefs.limitTertiary)      { prefs.limitTertiary      = it }
+        speedLimitRow("unclassified",  prefs.limitUnclassified)  { prefs.limitUnclassified  = it }
+        speedLimitRow("residential",   prefs.limitResidential)   { prefs.limitResidential   = it }
+        speedLimitRow("living_street", prefs.limitLivingStreet)  { prefs.limitLivingStreet  = it }
 
         controls.addView(label("Pinch anywhere to resize · Drag number in preview to reposition"))
 
@@ -335,11 +375,8 @@ class MainActivity : AppCompatActivity() {
 
 /**
  * Preview view — mock-up of the phone screen at correct scale.
- *
- * Cycles between a light and a dark background every 3 seconds.
- * Shows demo speed 123, demo speed limit 80, and NW direction arrow
- * at the current prefs-defined size and position.
- *
+ * Cycles between light and dark background every 3 seconds.
+ * Shows demo speed 123, speed limit 80, NW arrow.
  * Drag the number to reposition the actual overlay.
  */
 class OverlayPreviewView(
@@ -372,10 +409,17 @@ class OverlayPreviewView(
         style = Paint.Style.STROKE; strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND
     }
     private val limitFill   = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.RIGHT
+        style = Paint.Style.FILL; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
     }
     private val limitStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.RIGHT
+        style = Paint.Style.STROKE; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val infoFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
+    }
+    private val infoStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
         strokeJoin = Paint.Join.ROUND
     }
 
@@ -403,16 +447,11 @@ class OverlayPreviewView(
         canvas.restore()
     }
 
-    // -----------------------------------------------------------------------
-    // Light theme
-    // -----------------------------------------------------------------------
     private fun drawLightBackground(canvas: Canvas, pw: Float, ph: Float) {
         p.style = Paint.Style.FILL
-        p.color = Color.rgb(242, 242, 247)
-        canvas.drawRect(0f, 0f, pw, ph, p)
+        p.color = Color.rgb(242, 242, 247); canvas.drawRect(0f, 0f, pw, ph, p)
         val navH = ph * 0.08f
-        p.color = Color.rgb(20, 90, 180)
-        canvas.drawRect(0f, 0f, pw, navH, p)
+        p.color = Color.rgb(20, 90, 180); canvas.drawRect(0f, 0f, pw, navH, p)
         p.color = Color.WHITE
         canvas.drawRect(pw*0.06f, navH*0.3f, pw*0.35f, navH*0.55f, p)
         canvas.drawRect(pw*0.06f, navH*0.62f, pw*0.28f, navH*0.75f, p)
@@ -449,9 +488,6 @@ class OverlayPreviewView(
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Dark theme
-    // -----------------------------------------------------------------------
     private fun drawDarkBackground(canvas: Canvas, pw: Float, ph: Float) {
         p.style = Paint.Style.FILL
         p.color = Color.rgb(15,15,18); canvas.drawRect(0f, 0f, pw, ph, p)
@@ -493,9 +529,6 @@ class OverlayPreviewView(
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Overlay — speed 123, speed limit 80, NW arrow
-    // -----------------------------------------------------------------------
     private fun drawOverlay(canvas: Canvas, pw: Float, ph: Float) {
         val scaledSize = prefs.textSizePx * scale
         val nx = (prefs.overlayX + prefs.overlayWidth) * scale
@@ -514,7 +547,6 @@ class OverlayPreviewView(
         canvas.drawText("123", nx, ny, strokePaint)
         canvas.drawText("123", nx, ny, textPaint)
 
-        // Shared bottom-row geometry (mirrors SpeedOverlayView logic, scaled)
         val arrowH  = scaledSize * 0.38f
         val indentD = arrowH * 0.28f
         val inset   = arrowH * 0.75f
@@ -525,19 +557,16 @@ class OverlayPreviewView(
         val cx      = (left + right) / 2f
         val cy      = (top + bottom) / 2f
 
-        // Speed limit centre mirrors arrow centre relative to nx
+        // Speed limit demo "80"
         val limitFontSize = arrowH * 0.75f
-        // talLim centre: arrowH*1.25f from overlay left edge (mirrors arrow from right)
-        val overlayLeftX = prefs.overlayX * scale
-        val limitCenterX = overlayLeftX + arrowH * 1.25f
+        val overlayLeftX  = prefs.overlayX * scale
+        val limitCenterX  = overlayLeftX + arrowH * 1.25f
         limitFill.apply {
             textSize = limitFontSize; color = prefs.fillColor; alpha = prefs.textAlpha
-            textAlign = Paint.Align.CENTER
         }
         limitStroke.apply {
             textSize = limitFontSize; color = prefs.strokeColor; alpha = prefs.textAlpha
             strokeWidth = prefs.strokeWidth * scale * 0.5f
-            textAlign = Paint.Align.CENTER
         }
         val lb = Rect()
         limitFill.getTextBounds("80", 0, 2, lb)
@@ -551,20 +580,38 @@ class OverlayPreviewView(
             lineTo(cx, bottom - indentD); lineTo(left, bottom); close()
         }
         arrowFill.apply   { color = prefs.fillColor;   alpha = prefs.textAlpha }
-        arrowStroke.apply {
-            color = prefs.strokeColor; alpha = prefs.textAlpha
-            strokeWidth = prefs.strokeWidth * scale * 0.5f
-        }
+        arrowStroke.apply { color = prefs.strokeColor; alpha = prefs.textAlpha; strokeWidth = prefs.strokeWidth * scale * 0.5f }
         canvas.save()
         canvas.rotate(-315f, cx, cy)
         canvas.drawPath(path, arrowFill)
         canvas.drawPath(path, arrowStroke)
         canvas.restore()
+
+        // Road info demo — name above type, bottom of screen
+        val infoFontSize = scaledSize * 0.38f * 0.75f * 0.5f
+        val infoCx       = pw / 2f
+        val lineH        = infoFontSize * 1.35f
+        val infoBaseY    = ph - lineH * 0.3f
+
+        infoFill.apply {
+            textSize = infoFontSize; color = prefs.fillColor; alpha = prefs.textAlpha
+        }
+        infoStroke.apply {
+            textSize = infoFontSize; color = prefs.strokeColor; alpha = prefs.textAlpha
+            strokeWidth = prefs.strokeWidth * scale * 0.4f
+        }
+
+        val infoLines = mutableListOf<String>()
+        if (prefs.showRoadName) infoLines.add("Køge Bugt Motorvej")
+        if (prefs.showRoadType) infoLines.add("motorway")
+
+        infoLines.forEachIndexed { i, line ->
+            val y = infoBaseY - (infoLines.size - 1 - i) * lineH
+            canvas.drawText(line, infoCx, y, infoStroke)
+            canvas.drawText(line, infoCx, y, infoFill)
+        }
     }
 
-    // -----------------------------------------------------------------------
-    // Touch — drag to reposition overlay
-    // -----------------------------------------------------------------------
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val pw      = screenW * scale
         val offsetX = (width  - pw) / 2f
