@@ -14,17 +14,30 @@ import android.view.*
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
+import java.io.File
 
 /**
  * SpeedOver Safety Awareness
  * Holle TechNolle, 2026
  *
- * Entry point. Handles permissions, starts the overlay service,
- * and shows the settings UI when brought to the foreground from recents.
+ * Entry point. Handles permissions, starts the overlay service, and shows the
+ * settings UI when brought to the foreground from recents.
+ *
+ * Everything in this file runs on the UI thread. The activity holds no state of
+ * its own beyond the preview view — all settings are written straight to Prefs and
+ * broadcast to OverlayService, which owns the live overlay.
  *
  * Personal use only. Untested. Built for Xiaomi T10 — may work on other devices.
  */
 class MainActivity : AppCompatActivity() {
+
+    companion object {
+        // Upper bound of the hard-limit slider. Independent of limitMotorway on
+        // purpose: hard limit is a standalone user setting, and deriving its range
+        // from another preference meant turning motorway off capped it at 10.
+        const val HARD_LIMIT_MAX = 160
+    }
 
     private lateinit var prefs: Prefs
     private lateinit var scaleDetector: ScaleGestureDetector
@@ -44,12 +57,20 @@ class MainActivity : AppCompatActivity() {
         else { Toast.makeText(this, "GPS permission required", Toast.LENGTH_LONG).show(); finish() }
     }
 
+    // Returning from the share sheet gives no indication of success, so we ask
+    // rather than delete — a failed mail share should not cost you the log.
+    private val shareLogLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { confirmDeleteDebugLog() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
         if (!hasLocationPermission()) requestLocationPermission() else checkAndStart()
     }
 
+    // Coming to the foreground means the user wants settings: hide the live overlay
+    // so it does not sit on top of the settings screen, then build the UI.
     override fun onResume() {
         super.onResume()
         if (OverlayService.isRunning) {
@@ -66,6 +87,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Builds the whole settings screen programmatically. Each control writes to
+    // Prefs immediately and broadcasts to OverlayService where a live update matters.
     private fun showSettingsUI() {
         val dm      = resources.displayMetrics
         val screenW = dm.widthPixels
@@ -77,6 +100,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         // --- PREVIEW ---
+        // Both preview and the scroll view below use height=0 with a weight. If the
+        // scroll view were WRAP_CONTENT it would measure its full content height —
+        // several screens' worth — and squeeze the preview to nothing.
         val preview = OverlayPreviewView(this, prefs, screenW, screenH) { newX, newY ->
             prefs.overlayX = newX; prefs.overlayY = newY
             sendBroadcast(
@@ -88,7 +114,7 @@ class MainActivity : AppCompatActivity() {
         preview.startThemeCycle()
         root.addView(preview, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0
-        ).apply { weight = 1f })
+        ).apply { weight = 0.35f })
 
         root.addView(View(this).apply {
             setBackgroundColor(Color.rgb(40, 40, 40))
@@ -107,6 +133,7 @@ class MainActivity : AppCompatActivity() {
             isAllCaps = true; letterSpacing = 0.08f
         }
 
+        // Returns the row plus its value TextView so callers can update the readout
         fun labelRow(labelText: String, value: String): Triple<LinearLayout, TextView, TextView> {
             val lbl   = TextView(this).apply {
                 text = labelText; setTextColor(Color.WHITE)
@@ -140,7 +167,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Colour
+        // Colour — each button shows its own colour and opens the RGB picker
         controls.addView(label("Colour"))
         val colourRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val fillBtn = Button(this).apply {
@@ -183,7 +210,8 @@ class MainActivity : AppCompatActivity() {
             preview.invalidate()
         })
 
-        // Opacity
+        // Opacity — this is paint alpha, multiplied on top of the window alpha that
+        // OverlayService controls for MIUI click-through
         val (alphaRow, _, alphaVal) = labelRow("Opacity", "${(prefs.textAlpha / 255f * 100).toInt()}%")
         controls.addView(alphaRow)
         controls.addView(seekBar(prefs.textAlpha, 0, 255) { v ->
@@ -192,29 +220,34 @@ class MainActivity : AppCompatActivity() {
             preview.invalidate()
         })
 
-        // GPS keepalive
+        // GPS keepalive — read by the service on its next timer tick, no broadcast needed
         val (gpsRow, _, gpsVal) = labelRow("GPS keepalive", "${prefs.gpsKeepaliveSeconds} sec")
         controls.addView(gpsRow)
         controls.addView(seekBar(prefs.gpsKeepaliveSeconds, 5, 60) { v ->
             prefs.gpsKeepaliveSeconds = v; gpsVal.text = "$v sec"
         })
 
-        // Speed limit update interval
+        // Speed limit interval — takes effect from the next fetch cycle
         val (limRow, _, limVal) = labelRow("Speed limit interval", "${prefs.speedLimitIntervalSeconds} sec")
         controls.addView(limRow)
         controls.addView(seekBar(prefs.speedLimitIntervalSeconds, 5, 60) { v ->
             prefs.speedLimitIntervalSeconds = v; limVal.text = "$v sec"
         })
 
-        // Overpass query radius
+        // Overpass search radius around the current GPS position
         val (radRow, _, radVal) = labelRow("Speed limit radius", "${prefs.overpassRadiusMeters} m")
         controls.addView(radRow)
         controls.addView(seekBar(prefs.overpassRadiusMeters, 10, 150) { v ->
             prefs.overpassRadiusMeters = v; radVal.text = "$v m"
         })
 
-        // Road info display toggles
+        // Road info toggles — listed in the same order they appear on the overlay:
+        // ref on top, then name, then type at the bottom
         controls.addView(label("Road info"))
+        controls.addView(switchRow("Show road ref", prefs.showRoadRef) { v ->
+            prefs.showRoadRef = v
+            sendBroadcast(Intent(OverlayService.ACTION_UPDATE_PREFS).setPackage(packageName))
+        })
         controls.addView(switchRow("Show road name", prefs.showRoadName) { v ->
             prefs.showRoadName = v
             sendBroadcast(Intent(OverlayService.ACTION_UPDATE_PREFS).setPackage(packageName))
@@ -224,13 +257,26 @@ class MainActivity : AppCompatActivity() {
             sendBroadcast(Intent(OverlayService.ACTION_UPDATE_PREFS).setPackage(packageName))
         })
 
-        // Speed limits by road type (OSM names, 0 = disabled)
+        // Hard limit — 0 = off. Acts as a ceiling on the OSM limit; the asterisk on
+        // the overlay appears only when it is actually the binding value.
+        val hardLimitDisplay = if (prefs.hardLimit == 0) "off" else "${prefs.hardLimit}"
+        val (hardRow, _, hardVal) = labelRow("Hard limit  (* = binding)", hardLimitDisplay)
+        controls.addView(hardRow)
+        controls.addView(seekBar(prefs.hardLimit, 0, HARD_LIMIT_MAX) { v ->
+            prefs.hardLimit = v
+            hardVal.text = if (v == 0) "off" else "$v"
+            sendBroadcast(Intent(OverlayService.ACTION_UPDATE_PREFS).setPackage(packageName))
+            preview.invalidate()
+        })
+
+        // Per-road-type fallbacks, used only when OSM has no explicit maxspeed.
+        // Labels are the raw OSM names so they translate to any country's own terms.
         controls.addView(label("Speed limits by road type  (0 = off)"))
 
         fun speedLimitRow(osmName: String, current: Int, onSave: (Int) -> Unit) {
             val (row, _, valTv) = labelRow(osmName, if (current == 0) "off" else "$current")
             controls.addView(row)
-            controls.addView(seekBar(current, 0, 140) { v ->
+            controls.addView(seekBar(current, 0, 160) { v ->
                 valTv.text = if (v == 0) "off" else "$v"
                 onSave(v)
             })
@@ -247,6 +293,21 @@ class MainActivity : AppCompatActivity() {
         speedLimitRow("residential",   prefs.limitResidential)   { prefs.limitResidential   = it }
         speedLimitRow("living_street", prefs.limitLivingStreet)  { prefs.limitLivingStreet  = it }
 
+        // Debug logging — off by default, writes Overpass outcomes with GPS position
+        controls.addView(label("Debugging"))
+        controls.addView(switchRow("Enable debug log", prefs.enableDebugLog) { v ->
+            prefs.enableDebugLog = v
+            sendBroadcast(Intent(OverlayService.ACTION_UPDATE_PREFS).setPackage(packageName))
+        })
+        controls.addView(Button(this).apply {
+            text = "Share log"
+            setBackgroundColor(Color.rgb(40, 40, 40)); setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = 8 }
+            setOnClickListener { shareDebugLog() }
+        })
+
         controls.addView(label("Pinch anywhere to resize · Drag number in preview to reposition"))
 
         controls.addView(Button(this).apply {
@@ -260,14 +321,16 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
+        // Weighted like the preview above so both get a fixed share of the screen
         val scrollView = ScrollView(this).apply {
             addView(controls)
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            )
+                LinearLayout.LayoutParams.MATCH_PARENT, 0
+            ).apply { weight = 0.65f }
         }
         root.addView(scrollView)
 
+        // Pinch anywhere on the settings screen resizes the live overlay
         scaleDetector = ScaleGestureDetector(this,
             object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 override fun onScale(detector: ScaleGestureDetector): Boolean {
@@ -283,6 +346,8 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
     }
 
+    // RGB picker with presets. onPick fires only on OK, so cancelling leaves the
+    // stored colour untouched.
     private fun showColorPicker(title: String, current: Int, onPick: (Int) -> Unit) {
         val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 20, 40, 20) }
         val rSeek  = SeekBar(this).apply { max = 255; progress = Color.red(current) }
@@ -334,6 +399,8 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("Cancel", null).show()
     }
 
+    // SeekBar with an arbitrary minimum — Android's SeekBar always starts at 0,
+    // so the offset is applied on the way in and out.
     private fun seekBar(initial: Int, min: Int, max: Int, onChange: (Int) -> Unit): SeekBar {
         return SeekBar(this).apply {
             this.max = max - min; progress = initial - min
@@ -351,9 +418,46 @@ class MainActivity : AppCompatActivity() {
         else startOverlayService()
     }
 
+    // Starts the service then drops to the background — the overlay is the product,
+    // this activity only exists for settings.
     private fun startOverlayService() {
         if (!OverlayService.isRunning) startForegroundService(Intent(this, OverlayService::class.java))
         moveTaskToBack(true)
+    }
+
+    // Shares the debug log through the system share sheet. A FileProvider URI is
+    // required — a raw file:// path would throw FileUriExposedException.
+    private fun shareDebugLog() {
+        val file = File(filesDir, "speedover_debug.log")
+        if (!file.exists() || file.length() == 0L) {
+            Toast.makeText(this, "No log data yet", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        shareLogLauncher.launch(Intent.createChooser(intent, "Share SpeedOver debug log"))
+    }
+
+    private fun deleteDebugLog() {
+        val file = File(filesDir, "speedover_debug.log")
+        if (file.exists()) file.delete()
+    }
+
+    // Asked after the share sheet closes. Android gives no success signal, so the
+    // decision is left to the person who can actually see whether the mail sent.
+    private fun confirmDeleteDebugLog() {
+        val file = File(filesDir, "speedover_debug.log")
+        if (!file.exists()) return
+        AlertDialog.Builder(this)
+            .setTitle("Delete debug log?")
+            .setMessage("Only delete if the share succeeded. If something went wrong, keep the log and try again.")
+            .setPositiveButton("Delete") { _, _ -> deleteDebugLog() }
+            .setNegativeButton("Keep", null)
+            .show()
     }
 
     private fun hasLocationPermission() =
@@ -367,6 +471,8 @@ class MainActivity : AppCompatActivity() {
         ))
     }
 
+    // Intercepted at the window level so pinch works anywhere on the settings screen,
+    // not just over the preview.
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (::scaleDetector.isInitialized) scaleDetector.onTouchEvent(event)
         return super.dispatchTouchEvent(event)
@@ -374,10 +480,14 @@ class MainActivity : AppCompatActivity() {
 }
 
 /**
- * Preview view — mock-up of the phone screen at correct scale.
- * Cycles between light and dark background every 3 seconds.
- * Shows demo speed 123, speed limit 80, NW arrow.
- * Drag the number to reposition the actual overlay.
+ * Preview view — a scale mock-up of the phone screen showing where the overlay
+ * will sit and how it will look. Cycles light/dark every 3 seconds so colour and
+ * opacity choices can be judged against both.
+ *
+ * Demo values: speed 123, limit 80 (or the hard limit when set), NW arrow, and
+ * road info at the bottom. Drag the speed number to reposition the real overlay.
+ *
+ * All drawing runs on the UI thread.
  */
 class OverlayPreviewView(
     context: Context,
@@ -415,6 +525,13 @@ class OverlayPreviewView(
         style = Paint.Style.STROKE; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
         strokeJoin = Paint.Join.ROUND
     }
+    private val asteriskFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.LEFT
+    }
+    private val asteriskStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.LEFT
+        strokeJoin = Paint.Join.ROUND
+    }
     private val infoFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
     }
@@ -427,6 +544,7 @@ class OverlayPreviewView(
     private var lastRawX   = 0f
     private var lastRawY   = 0f
 
+    // Scale factor from real screen pixels down to preview pixels
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         scale = minOf(w.toFloat() / screenW, h.toFloat() / screenH)
     }
@@ -447,6 +565,8 @@ class OverlayPreviewView(
         canvas.restore()
     }
 
+    // Abstract stand-in for a light-themed app: nav bar, cards, text blocks.
+    // Purely decorative — its only job is to be a realistic backdrop.
     private fun drawLightBackground(canvas: Canvas, pw: Float, ph: Float) {
         p.style = Paint.Style.FILL
         p.color = Color.rgb(242, 242, 247); canvas.drawRect(0f, 0f, pw, ph, p)
@@ -488,6 +608,7 @@ class OverlayPreviewView(
         }
     }
 
+    // Same layout as the light mock-up, dark palette
     private fun drawDarkBackground(canvas: Canvas, pw: Float, ph: Float) {
         p.style = Paint.Style.FILL
         p.color = Color.rgb(15,15,18); canvas.drawRect(0f, 0f, pw, ph, p)
@@ -529,6 +650,8 @@ class OverlayPreviewView(
         }
     }
 
+    // Mirrors SpeedOverlayView.onDraw at preview scale. The geometry factors
+    // (0.38, 0.75, 1.25) must match that file or the preview lies about placement.
     private fun drawOverlay(canvas: Canvas, pw: Float, ph: Float) {
         val scaledSize = prefs.textSizePx * scale
         val nx = (prefs.overlayX + prefs.overlayWidth) * scale
@@ -557,10 +680,11 @@ class OverlayPreviewView(
         val cx      = (left + right) / 2f
         val cy      = (top + bottom) / 2f
 
-        // Speed limit demo "80"
+        // Speed limit — shows the hard limit when one is set, otherwise a demo 80
         val limitFontSize = arrowH * 0.75f
         val overlayLeftX  = prefs.overlayX * scale
         val limitCenterX  = overlayLeftX + arrowH * 1.25f
+        val limitText     = if (prefs.hardLimit > 0) prefs.hardLimit.toString() else "80"
         limitFill.apply {
             textSize = limitFontSize; color = prefs.fillColor; alpha = prefs.textAlpha
         }
@@ -569,12 +693,24 @@ class OverlayPreviewView(
             strokeWidth = prefs.strokeWidth * scale * 0.5f
         }
         val lb = Rect()
-        limitFill.getTextBounds("80", 0, 2, lb)
+        limitFill.getTextBounds(limitText, 0, limitText.length, lb)
         val limitY = cy + lb.height() / 2f - lb.bottom
-        canvas.drawText("80", limitCenterX, limitY, limitStroke)
-        canvas.drawText("80", limitCenterX, limitY, limitFill)
+        canvas.drawText(limitText, limitCenterX, limitY, limitStroke)
+        canvas.drawText(limitText, limitCenterX, limitY, limitFill)
 
-        // Direction arrow — NW demo
+        // Asterisk shown here whenever hard limit is set, so its placement can be
+        // judged. On the real overlay it appears only when hard limit is binding.
+        if (prefs.hardLimit > 0) {
+            val asteriskSize = limitFontSize * 0.6f
+            val asteriskX    = limitCenterX + lb.width() / 2f + limitFontSize * 0.05f
+            val asteriskY    = limitY - limitFontSize * 0.35f
+            asteriskFill.apply   { textSize = asteriskSize; color = prefs.fillColor;   alpha = prefs.textAlpha }
+            asteriskStroke.apply { textSize = asteriskSize; color = prefs.strokeColor; alpha = prefs.textAlpha; strokeWidth = prefs.strokeWidth * scale * 0.4f }
+            canvas.drawText("*", asteriskX, asteriskY, asteriskStroke)
+            canvas.drawText("*", asteriskX, asteriskY, asteriskFill)
+        }
+
+        // Direction arrow — fixed NW so its shape and rotation can be assessed
         val path = Path().apply {
             moveTo(cx, top); lineTo(right, bottom)
             lineTo(cx, bottom - indentD); lineTo(left, bottom); close()
@@ -587,24 +723,18 @@ class OverlayPreviewView(
         canvas.drawPath(path, arrowStroke)
         canvas.restore()
 
-        // Road info demo — name above type, bottom of screen
+        // Road info at the bottom, same order as the real overlay: ref, name, type
         val infoFontSize = scaledSize * 0.38f * 0.75f * 0.5f
         val infoCx       = pw / 2f
         val lineH        = infoFontSize * 1.35f
         val infoBaseY    = ph - lineH * 0.3f
-
-        infoFill.apply {
-            textSize = infoFontSize; color = prefs.fillColor; alpha = prefs.textAlpha
-        }
-        infoStroke.apply {
-            textSize = infoFontSize; color = prefs.strokeColor; alpha = prefs.textAlpha
-            strokeWidth = prefs.strokeWidth * scale * 0.4f
-        }
+        infoFill.apply   { textSize = infoFontSize; color = prefs.fillColor;   alpha = prefs.textAlpha }
+        infoStroke.apply { textSize = infoFontSize; color = prefs.strokeColor; alpha = prefs.textAlpha; strokeWidth = prefs.strokeWidth * scale * 0.4f }
 
         val infoLines = mutableListOf<String>()
+        if (prefs.showRoadRef)  infoLines.add("21")
         if (prefs.showRoadName) infoLines.add("Køge Bugt Motorvej")
         if (prefs.showRoadType) infoLines.add("motorway")
-
         infoLines.forEachIndexed { i, line ->
             val y = infoBaseY - (infoLines.size - 1 - i) * lineH
             canvas.drawText(line, infoCx, y, infoStroke)
@@ -612,6 +742,8 @@ class OverlayPreviewView(
         }
     }
 
+    // Dragging the speed number moves the real overlay. Hit area is generous —
+    // precision is not the point here.
     override fun onTouchEvent(event: MotionEvent): Boolean {
         val pw      = screenW * scale
         val offsetX = (width  - pw) / 2f
@@ -630,6 +762,7 @@ class OverlayPreviewView(
             }
             MotionEvent.ACTION_MOVE -> {
                 if (isDragging) {
+                    // Deltas are converted back to real screen pixels before saving
                     val dx   = ((event.rawX - lastRawX) / scale).toInt()
                     val dy   = ((event.rawY - lastRawY) / scale).toInt()
                     val maxX = (screenW - prefs.overlayWidth ).coerceAtLeast(0)

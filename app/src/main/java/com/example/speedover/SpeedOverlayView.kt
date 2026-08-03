@@ -11,6 +11,9 @@ import android.view.View
  * Holle TechNolle, 2026
  *
  * Draws speed number, speed limit (hidden when 0) and direction arrow.
+ * When hardLimitActive is true, a superscript asterisk is drawn after talLim.
+ * hardLimitActive is set by OverlayService only when the hard limit is the
+ * value that is actually constraining the displayed number (see applyEffectiveLimit).
  * ViolationGradient lives entirely in OverlayService / ViolationView.
  * Road name and road type live in RoadInfoView / OverlayService.
  *
@@ -26,6 +29,10 @@ class SpeedOverlayView(context: Context) : View(context) {
 
     // 0 = no data — talLim hidden entirely
     var speedLimitKmh: Int = 0
+        set(value) { field = value; invalidate() }
+
+    // When true, draws a superscript * after talLim to indicate hard limit is binding
+    var hardLimitActive: Boolean = false
         set(value) { field = value; invalidate() }
 
     var fillColor: Int = Color.WHITE
@@ -73,6 +80,16 @@ class SpeedOverlayView(context: Context) : View(context) {
         textAlign = Paint.Align.CENTER; style = Paint.Style.STROKE
     }
 
+    // --- Asterisk paint (superscript, left-aligned so it sits right of the limit text) ---
+    private val asteriskFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textAlign = Paint.Align.LEFT; style = Paint.Style.FILL
+    }
+    private val asteriskStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        textAlign = Paint.Align.LEFT; style = Paint.Style.STROKE
+    }
+
     // --- Direction arrow paints ---
     private val arrowFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val arrowStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -92,7 +109,6 @@ class SpeedOverlayView(context: Context) : View(context) {
         strokePaint.apply { textSize = textSizePx; color = strokeColor; alpha = textAlpha; strokeWidth = strokeWidthFactor }
         val x  = width.toFloat()
         val fm = fillPaint.fontMetrics
-        // Font metrics for stable vertical position regardless of which digits are shown
         val numberY = -fm.ascent + textSizePx * 0.05f
         canvas.drawText(text, x, numberY, strokePaint)
         canvas.drawText(text, x, numberY, fillPaint)
@@ -112,7 +128,6 @@ class SpeedOverlayView(context: Context) : View(context) {
         if (speedLimitKmh > 0) {
             val limitText     = speedLimitKmh.toString()
             val limitFontSize = arrowH * 0.75f
-            // Centre mirrors arrow centre relative to right edge
             val limitCenterX  = arrowH * 1.25f
 
             limitFillPaint.apply {
@@ -127,6 +142,23 @@ class SpeedOverlayView(context: Context) : View(context) {
             val limitY = cy + limitBounds.height() / 2f - limitBounds.bottom
             canvas.drawText(limitText, limitCenterX, limitY, limitStrokePaint)
             canvas.drawText(limitText, limitCenterX, limitY, limitFillPaint)
+
+            // --- Superscript asterisk when hard limit is the binding constraint ---
+            if (hardLimitActive) {
+                val asteriskSize = limitFontSize * 0.6f
+                val asteriskX    = limitCenterX + limitBounds.width() / 2f + limitFontSize * 0.05f
+                val asteriskY    = limitY - limitFontSize * 0.35f   // raised above baseline
+
+                asteriskFillPaint.apply {
+                    textSize = asteriskSize; color = fillColor; alpha = textAlpha
+                }
+                asteriskStrokePaint.apply {
+                    textSize = asteriskSize; color = strokeColor; alpha = textAlpha
+                    strokeWidth = strokeWidthFactor * 0.4f
+                }
+                canvas.drawText("*", asteriskX, asteriskY, asteriskStrokePaint)
+                canvas.drawText("*", asteriskX, asteriskY, asteriskFillPaint)
+            }
         }
 
         // --- Direction arrow ---
