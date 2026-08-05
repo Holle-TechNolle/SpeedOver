@@ -58,22 +58,32 @@ import kotlin.math.roundToInt
  *
  * Overpass instance rotation: three genuinely independent instances (separate
  * infrastructure, separate rate limiting). Never the same instance twice in a row
- * unless it is the only one alive. Any non-200 HTTP response marks that instance
- * dead until the next health check; a network timeout does NOT, since a timeout
- * says nothing about whether the server is up. Health is checked at startup and
- * every 20 minutes (all three instances). When every instance is currently dead,
- * fetchRoadInfo does not probe all three again — that would triple our request
- * volume during an outage that is already in progress. Instead it probes exactly
- * one instance (round-robin) and backs off on an escalating schedule (20s, 40s,
- * 60s, 2m, capping at 5m) until something answers.
+ * unless it is the only one available.
  *
- * Instance cooldown: five consecutive non-200 responses from the same instance,
- * with no success in between, parks it for two hours — no real queries, no health
- * probes, nothing. Timeouts do not count towards this; only real HTTP refusals do,
- * since a timeout says nothing about whether the server wants our traffic. Any 200
- * clears both the streak and the parking immediately. This exists because two of
- * the three instances answered 429 to every single request for an entire day while
- * still being re-probed on every sweep and every backoff tick.
+ * Failure taxonomy — the distinction that drives all of the availability logic:
+ *   timeout / network error → tells us nothing about the server. No marking, no
+ *                             counting. Try again next tick.
+ *   5xx (esp. 504)          → the server's own backend was too slow. Transient
+ *                             capacity, not a decision about us. Treated exactly
+ *                             like a timeout for a real query; a probe still uses
+ *                             it to set alive/dead, but it never counts towards
+ *                             parking.
+ *   4xx (esp. 429)          → the server made a policy decision about our traffic.
+ *                             Respected immediately with a 60-second pause that
+ *                             expires on the clock — no probe needed to rediscover
+ *                             the instance. Counts towards parking.
+ *
+ * Instance parking: five consecutive 4xx refusals with no success in between parks
+ * an instance — no queries, no probes. The parking period escalates each time an
+ * instance is parked again without having produced a single success in between:
+ * 2h, 4h, 8h, 16h, 24h. Any 200 resets the streak, the pause, the parking and the
+ * escalation level at once.
+ *
+ * When nothing is available, the service distinguishes between "an instance is
+ * serving out a 60-second pause and will return on its own" (just wait) and
+ * "everything is genuinely down" (probe one instance on an escalating 20s, 40s,
+ * 60s, 2m, 5m schedule). Conflating the two previously turned brief pauses into
+ * multi-minute blackouts.
  *
  * Timeout budget: the Overpass server-side [timeout:N] and the client-side
  * connect/read timeouts are deliberately NOT equal. If both are 5s, a server that
@@ -121,14 +131,32 @@ class OverlayService : Service() {
         const val LOG_MAX_LINES     = 2000
         const val LOG_TRIM_INTERVAL = 100
 
-        // An instance that answers with a non-200 status this many times in a row,
-        // with no success in between, is not having a bad minute — it is refusing
-        // us. The field log showed kumi.systems and private.coffee returning 429 to
-        // every single request across an entire day, yet still being re-probed every
-        // 20 minutes and on every backoff tick. Parking them for a long stretch cuts
-        // that noise without giving up on them permanently.
+        // An instance that answers with a REFUSAL status (4xx — the server made a
+        // policy decision about our traffic) this many times in a row, with no
+        // success in between, is not having a bad minute. Server-side errors (5xx)
+        // never count here: a 504 means the backend was too slow, which is a
+        // transient capacity problem, not a decision to reject us.
         const val HTTP_FAIL_COOLDOWN_THRESHOLD = 5
-        const val INSTANCE_COOLDOWN_MS = 2L * 60L * 60L * 1000L  // 2 hours
+
+        // Escalating parking periods. The level only advances when an instance is
+        // parked again without having produced a single success in between — so an
+        // instance that genuinely recovers never climbs the ladder, while one that
+        // refuses us all day backs off further each round instead of resetting to
+        // two hours forever. Any 200 resets the level to zero.
+        val COOLDOWN_LEVELS_MS = longArrayOf(
+            2L * 60 * 60 * 1000,    // 2 hours
+            4L * 60 * 60 * 1000,    // 4 hours
+            8L * 60 * 60 * 1000,    // 8 hours
+            16L * 60 * 60 * 1000,   // 16 hours
+            24L * 60 * 60 * 1000    // 24 hours (cap)
+        )
+
+        // A 429 is the server telling us to slow down, so we stop asking — but only
+        // briefly, and the instance returns to rotation on the clock rather than by
+        // spending a probe request to rediscover it. The field log showed four cases
+        // where a 429 was followed seconds later by a probe answering 200; the wait
+        // was the useful part, the probe was pure overhead.
+        const val REFUSAL_PAUSE_MS = 60_000L
 
         // Road type priority — lower number = higher priority
         val HIGHWAY_PRIORITY = mapOf(
@@ -168,36 +196,83 @@ class OverlayService : Service() {
     }
     private var lastUsedInstanceUrl: String? = null
 
-    // --- Per-instance cooldown after repeated refusals ---
-    // Counts consecutive non-200 HTTP responses per instance. Deliberately counts
-    // only real HTTP answers: a timeout tells us nothing about whether the server
-    // wants our traffic, so it neither increments nor resets this. Any 200 clears it.
+    // --- Per-instance availability ---
+    // Three independent gates, each answering a different question:
+    //   instanceAlive     — did the last health probe get through?
+    //   refusalPauseUntil — did the server just tell us to slow down? (self-expiring)
+    //   cooldownUntilMs   — has it been refusing us consistently? (long park)
+    // An instance must clear all three to be used for a real query.
+
+    // Counts consecutive REFUSAL responses (4xx) per instance. Server errors (5xx)
+    // and network timeouts are excluded on purpose: neither tells us the server has
+    // decided anything about our traffic. Any 200 clears the count.
     private val consecutiveHttpFailures = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
+    // elapsedRealtime after which a briefly-paused instance may be used again.
+    // Set on a 4xx, expires by itself — no probe needed to bring it back.
+    private val refusalPauseUntilMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
     // elapsedRealtime after which a parked instance may be tried again.
-    // Absent or in the past = not parked.
     private val cooldownUntilMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    // How many times this instance has been parked without a success in between.
+    // Indexes into COOLDOWN_LEVELS_MS. Reset to 0 by any 200.
+    private val cooldownLevel = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    // A 5xx is the server failing, not refusing — treat it like a timeout.
+    // Runs on: any thread
+    private fun isTransientServerError(code: Int): Boolean = code in 500..599
 
     // Runs on: any thread
     private fun isInCooldown(url: String): Boolean =
         SystemClock.elapsedRealtime() < (cooldownUntilMs[url] ?: 0L)
 
-    // Records a real HTTP refusal and parks the instance once the streak is long
-    // enough to be a pattern rather than a blip.
+    // Runs on: any thread
+    private fun isInRefusalPause(url: String): Boolean =
+        SystemClock.elapsedRealtime() < (refusalPauseUntilMs[url] ?: 0L)
+
+    // Instances usable for a real query right now
+    // Runs on: any thread
+    private fun availableInstances(): List<OverpassInstance> =
+        overpassInstances.filter {
+            instanceAlive[it.url] == true && !isInRefusalPause(it.url) && !isInCooldown(it.url)
+        }
+
+    // True when nothing is usable purely because of short refusal pauses — i.e. an
+    // instance will come back on its own within a minute. Distinguishing this from
+    // genuine unavailability is what stops us burning a probe on a 60-second wait.
+    // Runs on: UI thread
+    private fun waitingOnRefusalPauseOnly(): Boolean =
+        overpassInstances.any {
+            instanceAlive[it.url] == true && !isInCooldown(it.url) && isInRefusalPause(it.url)
+        }
+
+    // Records a real 4xx refusal: pause the instance briefly, and park it for hours
+    // once the streak shows this is policy rather than a blip.
     // Runs on: fetch worker thread or probe worker thread
-    private fun noteHttpFailure(instance: OverpassInstance, code: Int) {
+    private fun noteHttpRefusal(instance: OverpassInstance, code: Int) {
+        val now = SystemClock.elapsedRealtime()
+        refusalPauseUntilMs[instance.url] = now + REFUSAL_PAUSE_MS
+
         val streak = (consecutiveHttpFailures[instance.url] ?: 0) + 1
         consecutiveHttpFailures[instance.url] = streak
+
         if (streak >= HTTP_FAIL_COOLDOWN_THRESHOLD && !isInCooldown(instance.url)) {
-            cooldownUntilMs[instance.url] = SystemClock.elapsedRealtime() + INSTANCE_COOLDOWN_MS
-            logDebug("COOLDOWN ${instance.name} parked for ${INSTANCE_COOLDOWN_MS / 60_000}min after $streak consecutive http=$code")
+            val level    = (cooldownLevel[instance.url] ?: 0).coerceAtMost(COOLDOWN_LEVELS_MS.lastIndex)
+            val parkMs   = COOLDOWN_LEVELS_MS[level]
+            cooldownUntilMs[instance.url] = now + parkMs
+            // Advance the ladder for next time. Only a success resets it.
+            cooldownLevel[instance.url] = (level + 1).coerceAtMost(COOLDOWN_LEVELS_MS.lastIndex)
+            logDebug("COOLDOWN ${instance.name} parked ${parkMs / 60_000}min (level $level) after $streak consecutive http=$code")
         }
     }
 
     // Runs on: fetch worker thread or probe worker thread
     private fun noteHttpSuccess(instance: OverpassInstance) {
         consecutiveHttpFailures[instance.url] = 0
+        refusalPauseUntilMs.remove(instance.url)
         cooldownUntilMs.remove(instance.url)
+        cooldownLevel[instance.url] = 0
     }
 
     // Guards against overlapping health check runs — the periodic 20-minute sweep
@@ -383,7 +458,10 @@ class OverlayService : Service() {
                     resetAllDeadBackoff()
                 } else if (reason.startsWith("http=")) {
                     val code = reason.removePrefix("http=").toIntOrNull() ?: 0
-                    noteHttpFailure(instance, code)
+                    // A 5xx probe failure marks the instance not-alive (that is the
+                    // probe's job) but must not count towards parking — the server
+                    // is struggling, not refusing.
+                    if (!isTransientServerError(code)) noteHttpRefusal(instance, code)
                 }
                 logDebug("HEALTHCHECK ${instance.name} alive=$alive $reason")
             }
@@ -421,7 +499,7 @@ class OverlayService : Service() {
                 resetAllDeadBackoff()
             } else if (reason.startsWith("http=")) {
                 val code = reason.removePrefix("http=").toIntOrNull() ?: 0
-                noteHttpFailure(instance, code)
+                if (!isTransientServerError(code)) noteHttpRefusal(instance, code)
             }
             logDebug("HEALTHCHECK_ADHOC ${instance.name} alive=$alive $reason")
             healthCheckInProgress.set(false)
@@ -433,7 +511,7 @@ class OverlayService : Service() {
     // instead of hammering instances already known to be refusing us.
     // Runs on: UI thread (called from fetchRoadInfo before the worker starts).
     private fun pickNextInstance(): OverpassInstance? {
-        val alive = overpassInstances.filter { instanceAlive[it.url] == true && !isInCooldown(it.url) }
+        val alive = availableInstances()
         if (alive.isEmpty()) return null
         val candidates = if (alive.size > 1) alive.filter { it.url != lastUsedInstanceUrl } else alive
         val chosen = if (candidates.isNotEmpty()) candidates.random() else alive.first()
@@ -847,10 +925,18 @@ class OverlayService : Service() {
         val instance = pickNextInstance()
 
         if (instance == null) {
-            // Everything is marked dead. Retrying all three blindly (as before) just
-            // collects more rejections during an outage that is already happening —
-            // back off on an escalating schedule and probe only one instance per
-            // attempt instead.
+            // Nothing usable. Two very different situations hide behind that, and
+            // conflating them is what previously turned a 60-second wait into a
+            // multi-minute backoff climb.
+            if (waitingOnRefusalPauseOnly()) {
+                // An instance is merely serving out a short pause and will return by
+                // itself. Waiting is the correct and cheapest response — no probe,
+                // no backoff escalation.
+                logDebug("REFUSAL_PAUSE waiting for instance to return | $gpsTag")
+                return
+            }
+            // Genuinely unavailable: probe one instance on an escalating schedule
+            // rather than re-probing all of them on every tick.
             val now = SystemClock.elapsedRealtime()
             if (now < nextAllDeadProbeAtMs) {
                 val waitSec = (nextAllDeadProbeAtMs - now) / 1000
@@ -904,13 +990,21 @@ class OverlayService : Service() {
                             logDebug("OVERPASS_OK ${instance.name} http=200 | EMPTY (no elements) | $gpsTag")
                         }
                     }
+                } else if (isTransientServerError(code)) {
+                    // 504 and friends: the server's own backend timed out. This is
+                    // the same phenomenon as our client-side timeout, just measured
+                    // one hop further in — and it clears within seconds. Marking the
+                    // instance dead here cost two multi-kilometre data blackouts in
+                    // the field log, every one of them undone by a probe moments
+                    // later. Log it and let the next tick try again.
+                    Log.w(TAG, "Overpass transient error ($code) on ${instance.name}")
+                    logDebug("OVERPASS_TRANSIENT ${instance.name} http=$code | $gpsTag")
                 } else {
-                    // Server answered, but refused. Take it out of rotation until the
-                    // next health check — but leave the displayed data alone. Enough
-                    // refusals in a row and noteHttpFailure parks it for hours.
-                    instanceAlive[instance.url] = false
-                    noteHttpFailure(instance, code)
-                    Log.e(TAG, "Overpass HTTP error ($code) on ${instance.name}")
+                    // 4xx: the server made a decision about our traffic. Respect it
+                    // immediately with a short pause, and let noteHttpRefusal park
+                    // the instance for hours if the refusals keep coming.
+                    noteHttpRefusal(instance, code)
+                    Log.e(TAG, "Overpass refused ($code) on ${instance.name}")
                     logDebug("OVERPASS_ERR ${instance.name} http=$code | $gpsTag")
                 }
             } catch (e: Exception) {
